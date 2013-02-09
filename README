@@ -1,15 +1,6 @@
-Until I find a way to patch the kernel from a device tree in a nice way,
-I will put modified source in this directory.
-Just copy them to the kernel tree.
-
-kernel/drivers/platform/x86/asus-laptop.c 
-kernel/kernel/power/suspend.c
-
-delete folder hardware/libsensors
-
-
 Kernel modules are now in wetab tree, and will be compiled during normal make
 
-#hid-multitouch: still needed for real dual-touch
-asus-laptop:    needed for autorotate
-wakeup_button:  needed for correct resume
+asus-laptop: needed for autorotate
+wakeup_button: needed for correct resume
+
+Based on https://github.com/rbraken/wetab-ICS-device-tree
