@@ -3,4 +3,7 @@ Kernel modules are now in wetab tree, and will be compiled during normal make
 asus-laptop: needed for autorotate
 wakeup_button: needed for correct resume
 
+kernel/drivers/bluetooth/ath3k.c
+kernel/drivers/bluetooth/btusb.c
+
 Based on https://github.com/rbraken/wetab-ICS-device-tree
