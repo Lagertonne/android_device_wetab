@@ -1,456 +1,340 @@
-/*
- * w500_sensor.c
+/**
  *
- *      Created on: 28.05.2012
- *      Author: Marek Vasut <marex@denx.de>
- *      Licensed under GPLv2 or later
- */
+ * Atkbd style sensor
+ *
+ * Copyright (C) 2011-2013 The Android-x86 Open Source Project
+ *
+ * by Chih-Wei Huang <cwhuang@linux.org.tw>
+ *
+ * Licensed under GPLv2 or later
+ *
+ **/
 
-#define LOG_TAG "WetabSensors"
+#define LOG_TAG "WetabSensor"
 
-#include <linux/types.h>
-#include <linux/input.h>
-#include <linux/joystick.h>
+#include <cmath>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <sys/stat.h>
+#include <poll.h>
 #include <fcntl.h>
-#include <cutils/sockets.h>
-#include <cutils/log.h>
-#include <cutils/native_handle.h>
 #include <dirent.h>
-#include <math.h>
+#include <cutils/log.h>
+#include <linux/input.h>
+#include <linux/uinput.h>
 #include <hardware/sensors.h>
+#include <cutils/properties.h>
 
-#define DRIVER_DESC 			"Acer BMA150 accelerometer"
-#define SENS_COUNT			3
-#define SENS_LIGHT			0
-#define SENS_ROTATE			1
-#define SENS_ACCEL			2
-#define ID_AMBIENT_LIGHT		(SENSORS_HANDLE_BASE + SENS_LIGHT)
-#define ID_ROTATION_VECTOR		(SENSORS_HANDLE_BASE + SENS_ROTATE)
-#define ID_ACCELEROMETER		(SENSORS_HANDLE_BASE + SENS_ACCEL)
-
-#define VALID_LIGHT			(1 << 0)
-#define VALID_ROTATE			(1 << 1)
-#define VALID_ACCEL			(1 << 2)
-
-#define VALID_ROTATE_X			(1 << 0)
-#define VALID_ROTATE_Y			(1 << 1)
-#define VALID_ROTATE_Z			(1 << 2)
-#define VALID_ROTATE_MASK		(7 << 0)
-
-struct sensor_context {
-	struct sensors_poll_device_t device;
-	int accel_fd;
-
-	struct timespec delay;
-
-	uint32_t sent;
-	uint32_t valid;
-
-	int light_data;
-	int orientation_data[3];
-	uint8_t orientation_valid;
+struct KbdSensorKeys {
+	char name[64];
+	int keys[8];
+} KeysType[] = {
+	{ "", { } },
+	{ "AT Translated Set 2 keyboard", { EV_KEY, KEY_UP, KEY_RIGHT, KEY_DOWN, KEY_LEFT, KEY_LEFTALT, KEY_LEFTCTRL, 1 } },
+	{ "AT Translated Set 2 keyboard", { EV_MSC, 91, 115, 123, 109, KEY_LEFTALT, KEY_LEFTCTRL, 3 } },
+	{ "AT Translated Set 2 keyboard", { EV_KEY, KEY_F5, KEY_F8, KEY_F6, KEY_F7, KEY_LEFTALT, KEY_LEFTCTRL, 1 } },
+	{ "AT Translated Set 2 keyboard", { EV_KEY, KEY_F9, KEY_F12, KEY_F10, KEY_F11, KEY_LEFTALT, KEY_LEFTCTRL, 1 } },
+	{ "Asus Laptop extra buttons", { EV_KEY, KEY_F9, KEY_F12, KEY_F10, KEY_F11, KEY_LEFTALT, KEY_LEFTCTRL, 2 } },
+	{ "HP WMI hotkeys", { -1, KEY_DIRECTION, 0, 0, 0, 0, 0, 3 } },
 };
 
-static int open_accel_sensor(void)
+const int ID_ACCELERATION = (SENSORS_HANDLE_BASE + 0);
+
+template <typename T> struct SensorFd : T {
+	SensorFd(const struct hw_module_t *module, struct hw_device_t **device);
+};
+
+template <typename T> SensorFd<T>::SensorFd(const struct hw_module_t *module, struct hw_device_t **device)
 {
-	const char *dirname = "/dev/input";
-	DIR *dir;
-	struct dirent *de;
-	char name[PATH_MAX];
-	int ret;
-	int fd;
+	this->common.tag     = HARDWARE_DEVICE_TAG;
+	this->common.version = 0;
+	this->common.module  = const_cast<struct hw_module_t *>(module);
+	*device              = &this->common;
+	ALOGD("%s: module=%p dev=%p", __FUNCTION__, module, *device);
+}
 
+struct SensorPollContext : SensorFd<sensors_poll_device_t> {
+  public:
+	SensorPollContext(const struct hw_module_t *module, struct hw_device_t **device);
+	~SensorPollContext();
+	bool isValid() const { return (pfd.fd >= 0); }
+
+  private:
+	static int poll_close(struct hw_device_t *dev);
+	static int poll_activate(struct sensors_poll_device_t *dev, int handle, int enabled);
+	static int poll_setDelay(struct sensors_poll_device_t *dev, int handle, int64_t ns);
+	static int poll_poll(struct sensors_poll_device_t *dev, sensors_event_t *data, int count);
+
+	int doPoll(sensors_event_t *data, int count);
+
+	enum {
+		ROT_0,
+		ROT_90,
+		ROT_180,
+		ROT_270
+	};
+
+	bool enabled;
+	int rotation;
+	struct timespec delay;
+	struct pollfd pfd;
+	sensors_event_t orients[4];
+	KbdSensorKeys *ktype;
+};
+
+SensorPollContext::SensorPollContext(const struct hw_module_t *module, struct hw_device_t **device)
+      : SensorFd<sensors_poll_device_t>(module, device), enabled(false), rotation(ROT_0), ktype(KeysType)
+{
+	common.close = poll_close;
+	activate     = poll_activate;
+	setDelay     = poll_setDelay;
+	poll         = poll_poll;
+
+	int &fd = pfd.fd;
 	fd = -1;
-	dir = opendir(dirname);
-	if (dir != NULL) {
-		/*
-		 * Loop over all "eventXX" in /dev/input and look
-		 * for our driver.
-		 */
-		ALOGD("%s[%i] Looping over all eventXX...", __func__, __LINE__);
-		while ((de = readdir(dir))) {
-			if (de->d_name[0] != 'e')
+	const char *dirname = "/dev/input";
+	char prop[PROPERTY_VALUE_MAX];
+	if (property_get("hal.sensors.kbd.keys", prop, 0))
+		sscanf(prop, "%s,%d,%d,%d,%d,%d,%d,%d,%d", ktype->name, ktype->keys,
+				ktype->keys + 1, ktype->keys + 2, ktype->keys + 3, ktype->keys + 4, ktype->keys + 5, ktype->keys + 6, ktype->keys + 7);
+	else if (property_get("hal.sensors.kbd.type", prop, 0))
+		ktype = &KeysType[atoi(prop)];
+	else
+		ktype = 0;
+	if (DIR *dir = opendir(dirname)) {
+		char name[PATH_MAX];
+		while (struct dirent *de = readdir(dir)) {
+			if (de->d_name[0] != 'e') // not eventX
 				continue;
-			memset(name, 0, PATH_MAX);
 			snprintf(name, PATH_MAX, "%s/%s", dirname, de->d_name);
-			ALOGD("%s[%i] Open device %s", __func__, __LINE__, name);
-
 			fd = open(name, O_RDWR);
 			if (fd < 0) {
-				ALOGD("%s[%i] Could not open %s, %s", __func__,
-					__LINE__, name, strerror(errno));
+				ALOGE("could not open %s, %s", name, strerror(errno));
 				continue;
 			}
-
-			name[PATH_MAX - 1] = '\0';
-			ret = ioctl(fd, EVIOCGNAME(PATH_MAX - 1), &name);
-			if (ret < 1) {
-				ALOGD("%s[%i] Could not get device name for "
-					"%s, %s\n", __func__, __LINE__,
-					name, strerror(errno));
+			name[sizeof(name) - 1] = '\0';
+			if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
+				ALOGE("could not get device name for %s, %s\n", name, strerror(errno));
 				name[0] = '\0';
 			}
 
-			ALOGI("%s[%i] Testing device %s",
-					__func__, __LINE__, name);
-
-			if (!strcmp(name, DRIVER_DESC)) {
-				ALOGI("%s[%i] Found device %s",
-					__func__, __LINE__, name);
-				break;
+			if (ktype) {
+				if (!strcmp(name, ktype->name))
+					break;
+			} else {
+				ktype = KeysType + (sizeof(KeysType) / sizeof(KeysType[0]));
+				while (--ktype != KeysType)
+					if (!strcmp(name, ktype->name))
+						break;
+				if (ktype != KeysType)
+					break;
+				else
+					ktype = 0;
 			}
-
 			close(fd);
+			fd = -1;
 		}
-
-		ALOGD("%s[%i] stop loop and closing directory",
-			__func__, __LINE__);
+		ALOGI_IF(fd >= 0, "Open %s ok, fd=%d", name, fd);
 		closedir(dir);
 	}
 
-	return fd;
-}
-
-static int context__activate(struct sensors_poll_device_t *dev,
-				int handle, int enabled)
-{
-	struct sensor_context* ctx = (struct sensor_context *)dev;
-	int fd;
-
-	switch (handle) {
-	case SENS_ROTATE:
-		if (ctx->accel_fd >= 0)
-			return 0;
-
-		fd = open_accel_sensor();
-		if (fd < 0)
-			return -EINVAL;
-
-		ctx->accel_fd = fd;
-		return 0;
-
-	case SENS_LIGHT:
-	case SENS_ACCEL:
-		/* Light and fake accel need no activation. */
-		return 0;
-	}
-
-	return -EINVAL;
-}
-
-static int context__setDelay(struct sensors_poll_device_t *dev,
-				int handle, int64_t ns)
-{
-	struct sensor_context* ctx = (struct sensor_context *)dev;
-
-	ctx->delay.tv_sec = 0;
-	ctx->delay.tv_nsec = ns;
-
-	return 0;
-}
-
-static int context__close(struct hw_device_t *dev)
-{
-	struct sensor_context* ctx = (struct sensor_context *)dev;
-
-	close(ctx->accel_fd);
-
-	free(ctx);
-
-	return 0;
-}
-
-static int poll_data(struct sensors_poll_device_t *dev, sensors_event_t *data)
-{
-	struct input_event iev;
-	struct sensor_context *ctx = (struct sensor_context *)dev;
-	size_t res;
-	float val;
-	int i;
-
-	/* Orientation sensor */
-	for (;;) {
-		res = read(ctx->accel_fd, &iev, sizeof(struct input_event));
-		if (res != sizeof(struct input_event))
-			break;
-
-		if (iev.type != EV_ABS)
-			continue;
-
-		switch (iev.code) {
-		case ABS_X:
-			ctx->orientation_data[0] = iev.value;
-			ctx->orientation_valid |= VALID_ROTATE_X;
-			break;
-		case ABS_Y:
-			ctx->orientation_data[1] = iev.value;
-			ctx->orientation_valid |= VALID_ROTATE_Y;
-			break;
-		case ABS_Z:
-			ctx->orientation_data[2] = iev.value;
-			ctx->orientation_valid |= VALID_ROTATE_Z;
-			break;
-		case ABS_MISC:
-			ctx->light_data = iev.value;
-			ctx->valid |= VALID_LIGHT;
-			return 0;
-		default:
-			break;
-		}
-
-		if (ctx->orientation_valid == VALID_ROTATE_MASK) {
-			ctx->valid |= VALID_ROTATE;
-			return 0;
-		}
-	}
-
-	return 0;
-}
-
-static int craft_fake_accel(struct sensors_poll_device_t *dev, sensors_event_t *data)
-{
-	struct sensor_context *ctx = (struct sensor_context *)dev;
-
+	pfd.events = POLLIN;
+	orients[ROT_0].version = sizeof(sensors_event_t);
+	orients[ROT_0].sensor = ID_ACCELERATION;
+	orients[ROT_0].type = SENSOR_TYPE_ACCELEROMETER;
+	orients[ROT_0].acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
+	orients[ROT_270] = orients[ROT_180] = orients[ROT_90] = orients[ROT_0];
 	const double angle = 20.0;
 	const double cos_angle = GRAVITY_EARTH * cos(angle / M_PI);
 	const double sin_angle = GRAVITY_EARTH * sin(angle / M_PI);
+	orients[ROT_0].acceleration.x   = 0.0;
+	orients[ROT_0].acceleration.y   = cos_angle;
+	orients[ROT_0].acceleration.z   = sin_angle;
+	orients[ROT_90].acceleration.x  = cos_angle;
+	orients[ROT_90].acceleration.y  = 0.0;
+	orients[ROT_90].acceleration.z  = sin_angle;
+	orients[ROT_180].acceleration.x = 0.0;
+	orients[ROT_180].acceleration.y = -cos_angle;
+	orients[ROT_180].acceleration.z = -sin_angle;
+	orients[ROT_270].acceleration.x = -cos_angle;
+	orients[ROT_270].acceleration.y = 0.0;
+	orients[ROT_270].acceleration.z = -sin_angle;
 
-	/*
-	 *              y=max
-	 *                |
-	 *                |
-	 *                |
-	 *                |
-	 * x=max ---------+--------- x=min
-	 *                |
-	 *                |
-	 *                |
-	 *                |
-	 *              y=min
-	 */
+	delay.tv_sec = 0;
+	delay.tv_nsec = 200000000L;
 
-	if (ctx->orientation_data[0] >= 10000) {
-		/* Landscape */
-		data->acceleration.x = 0.0f;
-		data->acceleration.y = cos_angle;
-		data->acceleration.z = sin_angle;
-	} else if (ctx->orientation_data[0] <= -10000) {
-		/* Flipped landscape */
-		data->acceleration.x = 0.0f;
-		data->acceleration.y = -cos_angle;
-		data->acceleration.z = -sin_angle;
-	} else if (ctx->orientation_data[1] <= -10000) {
-		/* Portrait */
-		data->acceleration.x = cos_angle;
-		data->acceleration.y = 0.0f;
-		data->acceleration.z = sin_angle;
-	} else if (ctx->orientation_data[1] >= 10000) {
-		/* Flipped portrait */
-		data->acceleration.x = -cos_angle;
-		data->acceleration.y = 0.0f;
-		data->acceleration.z = -sin_angle;
-	} else {
-		/* No change */
+	ALOGD("%s: dev=%p fd=%d", __FUNCTION__, this, fd);
+}
+
+SensorPollContext::~SensorPollContext()
+{
+	close(pfd.fd);
+}
+
+int SensorPollContext::poll_close(struct hw_device_t *dev)
+{
+	ALOGD("%s: dev=%p", __FUNCTION__, dev);
+	delete reinterpret_cast<SensorPollContext *>(dev);
+	return 0;
+}
+
+int SensorPollContext::poll_activate(struct sensors_poll_device_t *dev, int handle, int enabled)
+{
+	ALOGD("%s: dev=%p handle=%d enabled=%d", __FUNCTION__, dev, handle, enabled);
+	SensorPollContext *ctx = reinterpret_cast<SensorPollContext *>(dev);
+	ctx->enabled = enabled;
+	return 0;
+}
+
+int SensorPollContext::poll_setDelay(struct sensors_poll_device_t *dev, int handle, int64_t ns)
+{
+	ALOGD("%s: dev=%p delay-ns=%lld", __FUNCTION__, dev, ns);
+	return 0;
+}
+
+int SensorPollContext::poll_poll(struct sensors_poll_device_t *dev, sensors_event_t *data, int count)
+{
+	ALOGV("%s: dev=%p data=%p count=%d", __FUNCTION__, dev, data, count);
+	SensorPollContext *ctx = reinterpret_cast<SensorPollContext *>(dev);
+	return ctx->doPoll(data, count);
+}
+
+int SensorPollContext::doPoll(sensors_event_t *data, int count)
+{
+	nanosleep(&delay, 0);
+	if (!isValid())
 		return 0;
-	}
 
-	return 1;
-}
-
-
-static int submit_sensor(struct sensors_poll_device_t *dev, sensors_event_t *data)
-{
-	struct sensor_context *ctx = (struct sensor_context *)dev;
-	int ret = 0;
-	struct timespec t;
-	const uint32_t end = ctx->sent;
-	uint32_t start = end;
-	ctx->sent = (ctx->sent + 1) % SENS_COUNT;
-
-	/* Get time for the event. */
-	memset(&t, 0, sizeof(t));
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	data->timestamp = ((int64_t)(t.tv_sec) * 1000000000LL) + t.tv_nsec;
-	data->version = sizeof(*data);
-
-	do {
-		start = (start + 1) % SENS_COUNT;
-
-		switch (ctx->valid & (1 << start)) {
-		case VALID_LIGHT:
-			data->sensor = ID_AMBIENT_LIGHT;
-			data->type = SENSOR_TYPE_LIGHT;
-
-			data->light = ctx->light_data;
-
-			ALOGD("%s[%i] LIGHT %d", __func__, __LINE__,
-					ctx->light_data);
-
-			ctx->valid &= ~(1 << start);
-			return 1;
-		case VALID_ROTATE:
-			data->sensor = ID_ROTATION_VECTOR;
-			data->type = SENSOR_TYPE_ROTATION_VECTOR;
-			data->orientation.status = SENSOR_STATUS_ACCURACY_MEDIUM;
-
-			float x = ctx->orientation_data[0];
-			float y = ctx->orientation_data[1];
-			float z = ctx->orientation_data[2];
-
-			data->orientation.x = x;
-			data->orientation.y = y;
-			data->orientation.z = z;
-
-			ALOGD("%s[%i] ROTATE %d %d %d -> %f %f %f",
-				__func__, __LINE__,
-				ctx->orientation_data[0],
-				ctx->orientation_data[1],
-				ctx->orientation_data[2],
-				data->orientation.x,
-				data->orientation.y,
-				data->orientation.z);
-
-			ctx->valid &= ~(1 << start);
-			ctx->valid |= VALID_ACCEL;
-			return 3;
-		case VALID_ACCEL:
-			data->sensor = ID_ACCELEROMETER;
-			data->type = SENSOR_TYPE_ACCELEROMETER;
-			data->acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
-
-			ret = craft_fake_accel(dev, data);
-
-			ALOGD("%s[%i] ACCEL %f %f %f",
-				__func__, __LINE__,
-				data->acceleration.x,
-				data->acceleration.y,
-				data->acceleration.z);
-
-			ctx->valid &= ~(1 << start);
-			return ret;
+	int *keys = ktype->keys;
+	while (int pollres = ::poll(&pfd, 1, -1)) {
+		if (pollres < 0) {
+			ALOGE("%s: poll %d error: %s", __FUNCTION__, pfd.fd, strerror(errno));
+			break;
 		}
-	} while (start != end);
+		if (!(pfd.revents & POLLIN)) {
+			ALOGW("%s: ignore revents %d", __FUNCTION__, pfd.revents);
+			continue;
+		}
 
-	return 0;
-}
+		struct input_event iev;
+		size_t res = ::read(pfd.fd, &iev, sizeof(iev));
+		if (res < sizeof(iev)) {
+			ALOGW("insufficient input data(%d)? fd=%d", res, pfd.fd);
+			continue;
+		}
+		ALOGV("type=%d scancode=%d value=%d from fd=%d", iev.type, iev.code, iev.value, pfd.fd);
+		if (iev.type == keys[0]) {
+			int rot;
+			int input = (keys[0] == EV_MSC) ? iev.value : iev.code;
+			if (input == keys[1])
+				rot = ROT_0;
+			else if (input == keys[2])
+				rot = ROT_90;
+			else if (input == keys[3])
+				rot = ROT_180;
+			else if (input == keys[4])
+				rot = ROT_270;
+			else if (input == keys[5] || input == keys[6])
+				rot = rotation;
+			else
+				rot = -1;
 
-static int context__poll(struct sensors_poll_device_t *dev, sensors_event_t *data, int count)
-{
-	struct sensor_context *ctx = (struct sensor_context *)dev;
-	int ret;
-
-	while (1) {
-
-		poll_data(dev, data);
-
-		ret = submit_sensor(dev, data);
-		if (ret)
-			return ret;
-
-		nanosleep(&ctx->delay, &ctx->delay);
+			if (rot >= 0) {
+				if (rot != rotation) {
+					ALOGI("orientation changed from %d to %d", rotation * 90, rot * 90);
+					rotation = rot;
+				}
+				if (enabled && count > 0)
+					break;
+			}
+		} else if (iev.type == EV_KEY) {
+			if (iev.code == keys[1] && iev.value) {
+				if (rotation == ROT_270)
+					rotation = ROT_0;
+				else
+					rotation++;
+			}
+			if (iev.code == keys[2] && iev.value) {
+				if (rotation == ROT_0)
+					rotation = ROT_270;
+				else
+					rotation--;
+			}
+			break;
+		} else if (iev.type == EV_SW && iev.code == SW_TABLET_MODE) {
+			if (!iev.value)
+				rotation = ROT_0;
+			else if (rotation == ROT_0)
+				rotation = ROT_90;
+			break;
+		}
 	}
 
-	return 0;
+	int cnt;
+	struct timespec t;
+	data[0] = orients[rotation];
+	t.tv_sec = t.tv_nsec = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	data[0].timestamp = int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
+	for (cnt = 1; cnt < keys[7] && cnt < count; ++cnt) {
+		data[cnt] = data[cnt - 1];
+		data[cnt].timestamp += delay.tv_nsec;
+		nanosleep(&delay, 0);
+	}
+	ALOGV("%s: dev=%p fd=%d rotation=%d cnt=%d", __FUNCTION__, this, pfd.fd, rotation * 90, cnt);
+	return cnt;
 }
 
-static const struct sensor_t sensor_list[] = {
-	[0] = {
-		.name		= "W500 Ambient Light sensor",
-		.vendor		= "Unknown",
-		.version	= 1,
-		.handle		= ID_AMBIENT_LIGHT,
-		.type		= SENSOR_TYPE_LIGHT,
-		.maxRange	= 100,
-		.resolution	= 1,
-		.power		= 1,
-		.minDelay	= 100,
-	},
-	[1] = {
-		.name		= "W500 Gyro sensor",
-		.vendor		= "BOSCH Sensortec",
-		.version	= 1,
-		.handle		= ID_ROTATION_VECTOR,
-		.type		= SENSOR_TYPE_ROTATION_VECTOR,
-		.maxRange	= 35000.0f,
-		.resolution	= 1.0f,
-		.power		= 1,
-		.minDelay	= 100,
-	},
-	[2] = {
-		.name		= "W500 Fake accelerometer",
-		.vendor		= "FooBar Technology Group",
-		.version	= 1,
-		.handle		= ID_ACCELEROMETER,
-		.type		= SENSOR_TYPE_ACCELEROMETER,
-		.maxRange	= 2.8f,
-		.resolution	= 1.0f/4032.0f,
-		.power		= 3.0f,
-		.minDelay	= 100,
-	},
+static int open_kbd_sensor(const struct hw_module_t *module, const char *id, struct hw_device_t **device)
+{
+	ALOGD("%s: id=%s", __FUNCTION__, id);
+	SensorPollContext *ctx = new SensorPollContext(module, device);
+	return (ctx && ctx->isValid()) ? 0 : -EINVAL;
+}
+
+static struct sensor_t sSensorListInit[] = {
+	{
+		name: "Kbd Orientation Sensor",
+		vendor: "Android-x86 Open Source Project",
+		version: 1,
+		handle: ID_ACCELERATION,
+		type: SENSOR_TYPE_ACCELEROMETER,
+		maxRange: 2.8f,
+		resolution: 1.0f/4032.0f,
+		power: 3.0f,
+		minDelay: 0,
+		fifoReservedEventCount: 0,
+		fifoMaxEventCount: 0,
+		stringType: SENSOR_STRING_TYPE_ACCELEROMETER,
+		requiredPermission: "",
+		maxDelay: 0,
+		flags: SENSOR_FLAG_ONE_SHOT_MODE,
+		reserved: { }
+	}
 };
 
-static int sensors__get_sensors_list(struct sensors_module_t *module,
-					const struct sensor_t **list)
+static int sensors_get_sensors_list(struct sensors_module_t *module, struct sensor_t const **list)
 {
-	*list = sensor_list;
-	return sizeof(sensor_list)/sizeof(sensor_list[0]);
+	*list = sSensorListInit;
+	return sizeof(sSensorListInit) / sizeof(struct sensor_t);
 }
 
-
-static int open_sensors(const struct hw_module_t *module, const char* id,
-			struct hw_device_t **device)
-{
-	struct sensor_context *ctx;
-	int fd;
-
-	if (strcmp(id, SENSORS_HARDWARE_POLL))
-		return -EINVAL;
-
-	/* Allocate context */
-	ctx = malloc(sizeof(*ctx));
-	if (!ctx)
-		return -ENOMEM;
-
-	memset(ctx, 0, sizeof(*ctx));
-
-	ctx->accel_fd = -1;
-	ctx->delay.tv_sec = 0;
-	ctx->delay.tv_nsec = 100;
-
-	/* Do common setup */
-	ctx->device.common.tag = HARDWARE_DEVICE_TAG;
-	ctx->device.common.version = 0;
-	ctx->device.common.module = (struct hw_module_t *)module;
-	ctx->device.common.close = context__close;
-
-	ctx->device.activate = context__activate;
-	ctx->device.setDelay = context__setDelay;
-	ctx->device.poll = context__poll;
-
-	*device = &ctx->device.common;
-
-	return 0;
-
-err_light:
-	close(ctx->accel_fd);
-err_accel:
-	free(ctx);
-	return -ENOMEM;
-}
-
-static struct hw_module_methods_t sensors_module_methods = {
-	.open	= open_sensors
+static struct hw_module_methods_t sensors_methods = {
+	open: open_kbd_sensor
 };
 
 struct sensors_module_t HAL_MODULE_INFO_SYM = {
-	.common = {
-		.tag		= HARDWARE_MODULE_TAG,
-		.version_major	= 1,
-		.version_minor	= 0,
-		.id		= SENSORS_HARDWARE_MODULE_ID,
-		.name		= "W500 SENSORS Module",
-		.author		= "Marek Vasut",
-		.methods	= &sensors_module_methods,
+	common: {
+		tag: HARDWARE_MODULE_TAG,
+		version_major: 2,
+		version_minor: 3,
+		id: SENSORS_HARDWARE_MODULE_ID,
+		name: "Kbd Orientation Sensor",
+		author: "Chih-Wei Huang",
+		methods: &sensors_methods,
+		dso: 0,
+		reserved: { }
 	},
-	.get_sensors_list	= sensors__get_sensors_list,
+	get_sensors_list: sensors_get_sensors_list
 };
