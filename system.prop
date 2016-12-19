@@ -1,0 +1,3 @@
+# system.prop for wetab
+
+hal.sensors.kbd.type=1

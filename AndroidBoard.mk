@@ -1,0 +1,9 @@
+LOCAL_PATH := $(call my-dir)
+#TARGET_INITRD_SCRIPTS := $(LOCAL_PATH)/wetab_info
+#TARGET_KERNEL_CONFIG := $(LOCAL_PATH)/wetab_defconfig
+#TARGET_EXTRA_KERNEL_MODULES := hdaps
+#TARGET_EXTRA_KERNEL_MODULES += wakeup_button
+
+TARGET_KERNEL_CONFIG := $(LOCAL_PATH)/wetab_defconfig
+
+include $(GENERIC_X86_ANDROID_MK)
