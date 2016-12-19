@@ -9,6 +9,6 @@ LOCAL_SHARED_LIBRARIES := liblog libcutils
 LOCAL_MODULE := sensors.$(TARGET_PRODUCT)
 LOCAL_MODULE_TAGS := optional
 
-LOCAL_SRC_FILES := wetab.cpp
+LOCAL_SRC_FILES := wetab.c
 
 include $(BUILD_SHARED_LIBRARY)
