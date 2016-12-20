@@ -19,7 +19,7 @@
 #include <math.h>
 #include <hardware/sensors.h>
 
-#define DRIVER_DESC 			"Microsoft X-Box 360 pad"
+#define DRIVER_DESC 			"Pegatron Lucid Tablet Accelerometer"
 #define SENS_COUNT			3
 #define SENS_LIGHT			0
 #define SENS_ROTATE			1
@@ -67,7 +67,7 @@ static int open_accel_sensor(void)
 		 * Loop over all "jsXX" in /dev/input and look
 		 * for our driver.
 		 */
-		ALOGD("%s[%i] Looping over all eventXX...", __func__, __LINE__);
+		ALOGD("%s[%i] Looping over all jsXX...", __func__, __LINE__);
 		while ((de = readdir(dir))) {
 			if (de->d_name[0] != 'j')
 				continue;
