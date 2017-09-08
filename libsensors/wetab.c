@@ -11,7 +11,6 @@
  **/
 
 /* #define LOG_NDEBUG 0 */
-<<<<<<< HEAD
 #define LOG_TAG "WetabSensors"
 
 #include <stdint.h>
